@@ -8,6 +8,7 @@ using System.Threading.Tasks;
 using Npgsql;
 using System.Globalization;
 using System.Data;
+using System.Text.Json.Serialization;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -45,6 +46,39 @@ channel.QueueDeclare(
     arguments: null
 );
 
+static void CreateFile()
+{
+    // Nome do arquivo de saída
+    string outputFile = "output.ndjson";
+
+    // Configurar as opções para ignorar indentações e escrever apenas uma linha
+    var options = new JsonSerializerOptions
+    {
+        WriteIndented = false
+    };
+
+    // Escrever as linhas no arquivo
+    using (StreamWriter file = File.CreateText(outputFile))
+    {
+        Random random = new Random();
+        for (int i = 1005890; i < 1006889; i++)
+        {
+            var obj = new { Id = i, Status = GetRandomStatus(random) };
+            string jsonLine = JsonSerializer.Serialize(obj, options);
+            file.WriteLine(jsonLine);
+        }
+    }
+}
+
+static string GetRandomStatus(Random random)
+{
+    string[] statuses = { "FAILED", "SUCCESS", "PROCESSING" };
+    int index = random.Next(statuses.Length);
+    return statuses[index];
+}
+
+CreateFile();
+
 Console.WriteLine("[*] Waiting for messages...");
 
 var consumer = new EventingBasicConsumer(channel);
@@ -57,26 +91,35 @@ consumer.Received += async (model, ea) =>
     Console.WriteLine("Received concilliation message: {0}", jsonMessage);
 
     var fileTransactions = ReadFile(concilliation.File);
-    var databasePayments = await GetAllPayments(concilliation.Date);
+    var databasePayments = await GetAllPayments(concilliation.Date, concilliation.BankId);
 
-    var databaseTransactionsSet = new HashSet<int>(databasePayments.Select(p => p.Id));
-    var comparisonResult = new
-{
-    databaseToFile = databasePayments
-        .Where(p => !fileTransactions.Any(t => t.Id == p.Id) &&
-                    (p.OriginBankId == concilliation.BankId || p.DestinyBankId == concilliation.BankId))
-        .ToList(),
-    fileToDatabase = fileTransactions
-        .Where(t => !databaseTransactionsSet.Contains(t.Id) &&
-                    databasePayments.Any(p => p.OriginBankId == concilliation.BankId || p.DestinyBankId == concilliation.BankId))
-        .ToList(),
-    differentStatus = fileTransactions
-        .Where(t => databaseTransactionsSet.Contains(t.Id) &&
-                    databasePayments.Any(p => p.OriginBankId == concilliation.BankId || p.DestinyBankId == concilliation.BankId))
+    Console.WriteLine($"Arquivo com: {fileTransactions.Count} entidades.");
+    Console.WriteLine($"Banco com: {databasePayments.Count} entidades.");
+
+    var fileTransactionsSet = new HashSet<int>(fileTransactions.Select(t => t.Id));
+    var databasePaymentsSet = new HashSet<int>(databasePayments.Select(p => p.Id));
+    var fileTransactionsStatusMap = fileTransactions.ToDictionary(t => t.Id, t => t.Status);
+
+    var databaseToFile = databasePayments
+        .Where(p => !fileTransactionsSet.Contains(p.Id))
+        .ToList();
+
+    var fileToDatabase = fileTransactions
+        .Where(t => !databasePaymentsSet.Contains(t.Id))
+        .ToList();
+
+    var differentStatus = fileTransactions
+        .Where(t => databasePaymentsSet.Contains(t.Id))
+        .Where(t => fileTransactionsStatusMap[t.Id] != databasePayments.First(p => p.Id == t.Id).Status)
         .Select(t => new DifferentStatusIds { Id = t.Id })
-        .Where(ds => fileTransactions.Any(t => t.Id == ds.Id && t.Status != databasePayments.First(p => p.Id == ds.Id).Status))
-        .ToList()
-};
+        .ToList();
+
+    var comparisonResult = new
+    {
+        databaseToFile,
+        fileToDatabase,
+        differentStatus
+    };
 
     await client.PostAsJsonAsync(concilliation.Postback, comparisonResult);
     Console.WriteLine($"Concilliation done with the result: {comparisonResult}");
@@ -84,9 +127,9 @@ consumer.Received += async (model, ea) =>
     channel.BasicAck(ea.DeliveryTag, false);
 };
 
-async Task<List<PaymentInfo>> GetAllPayments(string date)
+async Task<List<PaymentInfo>> GetAllPayments(string date, int bankId)
 {
-    var connectionString = "Host=localhost;Username=postgres;Password=151099;Database=pix-dotnet";
+    var connectionString = "Host=localhost:5433;Username=postgres;Password=postgres;Database=pix-dotnet-dockerized";
     using var postgresConnection = new NpgsqlConnection(connectionString);
     await postgresConnection.OpenAsync();
 
@@ -105,6 +148,8 @@ async Task<List<PaymentInfo>> GetAllPayments(string date)
                                 ""Accounts"" a ON k.""AccountId"" = a.""Id""
                             WHERE 
                                 k.""Id"" = p.""KeyId""
+                            AND
+                                a.""BankId""=@bankId
                         ) AS ""DestinyBankId""
                         FROM 
                             ""Payments"" p
@@ -113,10 +158,12 @@ async Task<List<PaymentInfo>> GetAllPayments(string date)
                         LEFT JOIN 
                             ""Keys"" k ON p.""KeyId"" = k.""Id""
                         WHERE
-                            DATE_TRUNC('day', p.""CreatedAt"") = @date";
+                            DATE_TRUNC('day', p.""CreatedAt"") = @date
+                        AND a.""BankId""=@bankId";
 
     using var command = new NpgsqlCommand(commandText, postgresConnection);
     command.Parameters.AddWithValue("@date", parsedDate);
+    command.Parameters.AddWithValue("@bankId", bankId);
     var payments = new List<PaymentInfo>();
 
     using var reader = command.ExecuteReader();
@@ -126,8 +173,12 @@ async Task<List<PaymentInfo>> GetAllPayments(string date)
         {
             Id = reader.GetInt32("PaymentId"),
             Status = reader.GetString("Status"),
-            OriginBankId = reader.GetInt32("OriginBankId"),
-            DestinyBankId = reader.GetInt32("DestinyBankId")
+            OriginBankId = reader.IsDBNull(reader.GetOrdinal("OriginBankId")) 
+            ? -1 // ou outro valor padrão apropriado
+            : reader.GetInt32("OriginBankId"),
+            DestinyBankId = reader.IsDBNull(reader.GetOrdinal("DestinyBankId")) 
+            ? -1 // ou outro valor padrão apropriado
+            : reader.GetInt32("DestinyBankId")
         };
 
         payments.Add(paymentInfo);
